@@ -1,0 +1,20 @@
+{
+  "name": "ustrat-operational-api",
+  "version": "1.0.0",
+  "description": "Serving layer API for the operational DB (Cosmos DB) - supply chain dashboard data",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "@azure/cosmos": "^4.1.1",
+    "@azure/identity": "^4.4.1",
+    "openai": "^4.60.0",
+    "jose": "^5.9.6",
+    "cors": "^2.8.5"
+  }
+}
