@@ -11,9 +11,10 @@ export const msalConfig = {
 };
 
 // Scope for our own API - requesting this triggers acquisition of a token
-// the API can validate, rather than a generic Microsoft Graph token.
+// APIM can validate, rather than a generic Microsoft Graph token.
 export const apiRequest = {
   scopes: ["api://5fcba1ce-8186-4dbb-9b35-e2f07ee74db6/access_as_user"],
 };
 
-export const API_BASE_URL = "https://ustrat-operational-api-crbubedtc3b7eah5.westus2-01.azurewebsites.net";
+// All calls go through APIM; the App Service rejects anything that didn't.
+export const API_BASE_URL = "https://ustrat-apim.azure-api.net/supply-chain";

@@ -1,0 +1,47 @@
+openapi: 3.0.1
+info:
+  title: Supply Chain API
+  version: "1.0"
+  description: Gateway for the operational API. Auth, CORS and data-scope routing are enforced by APIM policy (see policy.xml).
+servers:
+  - url: https://ustrat-operational-api-crbubedtc3b7eah5.westus2-01.azurewebsites.net
+paths:
+  /api/indicators:
+    get:
+      operationId: getIndicators
+      summary: Latest value for every indicator visible to the caller
+      responses:
+        "200":
+          description: Indicator values
+  /api/indicators/{seriesId}:
+    get:
+      operationId: getIndicatorBySeriesId
+      summary: Latest value for one indicator
+      parameters:
+        - name: seriesId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Indicator value
+        "404":
+          description: Not found or not visible to the caller
+  /api/chat:
+    post:
+      operationId: chat
+      summary: Ask a question grounded on the indicators visible to the caller
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                message:
+                  type: string
+              required: [message]
+      responses:
+        "200":
+          description: Model reply

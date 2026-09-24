@@ -1,6 +1,5 @@
+const crypto = require("crypto");
 const express = require("express");
-const cors = require("cors");
-const { createRemoteJWKSet, jwtVerify } = require("jose");
 const { CosmosClient } = require("@azure/cosmos");
 const { DefaultAzureCredential, getBearerTokenProvider } = require("@azure/identity");
 const { AzureOpenAI } = require("openai");
@@ -8,57 +7,41 @@ const { AzureOpenAI } = require("openai");
 const PORT = process.env.PORT || 8080;
 const COSMOS_ENDPOINT = process.env.COSMOS_ENDPOINT || "https://bc836f6d-54c1-43a9-b890-87cdb4428a90.zbc.sql.cosmos.fabric.microsoft.com:443/";
 const DATABASE_NAME = "operational_db";
-const CONTAINER_NAME = "supply_chain_dashboard";
+const FULL_CONTAINER = "supply_chain_dashboard";
+const RESTRICTED_CONTAINER = "supply_chain_dashboard_restricted";
 const OPENAI_ENDPOINT = process.env.OPENAI_ENDPOINT || "https://ustrat-ai-foundry.openai.azure.com/";
 const OPENAI_DEPLOYMENT = process.env.OPENAI_DEPLOYMENT || "gpt-5-mini";
 
-const TENANT_ID = process.env.TENANT_ID || "b1e769c7-78fc-4eb9-a371-2c14cbcc07af";
-const API_APP_ID = process.env.API_APP_ID || "5fcba1ce-8186-4dbb-9b35-e2f07ee74db6";
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://blue-cliff-0b313850f.5.azurestaticapps.net";
-const RESTRICTED_GROUP_ID = process.env.RESTRICTED_GROUP_ID || "20245927-4db0-4696-8374-35c40a6bdd2a";
-const RESTRICTED_SOURCE = "NY_FED";
+// Resolved by App Service from a Key Vault reference; APIM injects the same value on every request.
+const BACKEND_SHARED_SECRET = process.env.BACKEND_SHARED_SECRET;
 
-// True if the caller's token carries the restricted-data-viewers group.
-// Mirrors the Fabric Lakehouse's NYFedOnlyReader row-security role - same group, same restriction,
-// enforced independently here because Cosmos DB has no native row-level security of its own.
-function isRestrictedCaller(req) {
-  const groups = req.user?.groups || [];
-  return groups.includes(RESTRICTED_GROUP_ID);
-}
-
-function filterForCaller(req, items) {
-  return isRestrictedCaller(req) ? items.filter((i) => i.source === RESTRICTED_SOURCE) : items;
-}
-
-// Verifies Entra ID access tokens issued for this API's own scope (access_as_user).
-// Public signing keys are fetched (and cached) from Entra's own JWKS endpoint - no secret needed.
-const jwks = createRemoteJWKSet(new URL(`https://login.microsoftonline.com/${TENANT_ID}/discovery/v2.0/keys`));
-
-async function requireAuth(req, res, next) {
-  const authHeader = req.headers.authorization || "";
-  const [scheme, token] = authHeader.split(" ");
-  if (scheme !== "Bearer" || !token) {
-    return res.status(401).json({ error: "Missing or malformed Authorization header" });
+// Auth, CORS and the restricted/full decision all happen in APIM. This service only accepts
+// traffic proving it came through APIM, and trusts APIM's x-data-scope header for container choice.
+function requireGateway(req, res, next) {
+  if (!BACKEND_SHARED_SECRET) {
+    console.error("BACKEND_SHARED_SECRET is not configured - refusing all requests");
+    return res.status(503).json({ error: "Service misconfigured" });
   }
-
-  try {
-    const { payload } = await jwtVerify(token, jwks, {
-      issuer: `https://login.microsoftonline.com/${TENANT_ID}/v2.0`,
-      audience: [`api://${API_APP_ID}`, API_APP_ID],
-    });
-    req.user = payload;
-    next();
-  } catch (err) {
-    console.error("Token validation failed:", err.message);
-    res.status(401).json({ error: "Invalid or expired token", detail: err.message });
+  const provided = Buffer.from(req.headers["x-apim-secret"] || "");
+  const expected = Buffer.from(BACKEND_SHARED_SECRET);
+  if (provided.length !== expected.length || !crypto.timingSafeEqual(provided, expected)) {
+    return res.status(403).json({ error: "Requests must come through the API gateway" });
   }
+  next();
 }
 
-// DefaultAzureCredential automatically uses the App Service's managed identity
-// when running in Azure - no keys or connection strings needed.
 const credential = new DefaultAzureCredential();
-const client = new CosmosClient({ endpoint: COSMOS_ENDPOINT, aadCredentials: credential });
-const container = client.database(DATABASE_NAME).container(CONTAINER_NAME);
+const database = new CosmosClient({ endpoint: COSMOS_ENDPOINT, aadCredentials: credential }).database(DATABASE_NAME);
+const containers = {
+  full: database.container(FULL_CONTAINER),
+  restricted: database.container(RESTRICTED_CONTAINER),
+};
+
+// Anything other than an explicit "full" gets the restricted container, so a missing or
+// mangled header fails closed rather than exposing everything.
+function containerFor(req) {
+  return req.headers["x-data-scope"] === "full" ? containers.full : containers.restricted;
+}
 
 const azureADTokenProvider = getBearerTokenProvider(credential, "https://cognitiveservices.azure.com/.default");
 const openaiClient = new AzureOpenAI({
@@ -69,28 +52,27 @@ const openaiClient = new AzureOpenAI({
 });
 
 const app = express();
-app.use(cors({ origin: ALLOWED_ORIGIN }));
 app.use(express.json());
 
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-app.get("/api/indicators", requireAuth, async (req, res) => {
+app.get("/api/indicators", requireGateway, async (req, res) => {
   try {
-    const { resources } = await container.items.readAll().fetchAll();
-    res.json(filterForCaller(req, resources));
+    const { resources } = await containerFor(req).items.readAll().fetchAll();
+    res.json(resources);
   } catch (err) {
     console.error("Failed to read indicators:", err.message);
     res.status(502).json({ error: "Failed to read indicators", detail: err.message });
   }
 });
 
-app.get("/api/indicators/:seriesId", requireAuth, async (req, res) => {
+app.get("/api/indicators/:seriesId", requireGateway, async (req, res) => {
   const { seriesId } = req.params;
   try {
-    const { resource } = await container.item(seriesId, seriesId).read();
-    if (!resource || (isRestrictedCaller(req) && resource.source !== RESTRICTED_SOURCE)) {
+    const { resource } = await containerFor(req).item(seriesId, seriesId).read();
+    if (!resource) {
       return res.status(404).json({ error: `No indicator found for series_id '${seriesId}'` });
     }
     res.json(resource);
@@ -103,15 +85,15 @@ app.get("/api/indicators/:seriesId", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/api/chat", requireAuth, async (req, res) => {
+app.post("/api/chat", requireGateway, async (req, res) => {
   const { message } = req.body || {};
   if (!message || typeof message !== "string") {
     return res.status(400).json({ error: "Request body must include a 'message' string" });
   }
 
   try {
-    const { resources } = await container.items.readAll().fetchAll();
-    const context = filterForCaller(req, resources)
+    const { resources } = await containerFor(req).items.readAll().fetchAll();
+    const context = resources
       .map((r) => `- ${r.metric_name} (${r.series_id}): ${r.value} as of ${r.observation_date}, source ${r.source}`)
       .join("\n");
 

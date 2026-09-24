@@ -1,0 +1,63 @@
+<!--
+  API-scope policy for Supply Chain API.
+  Order matters: CORS first so browser preflights are answered before JWT validation rejects them.
+-->
+<policies>
+    <inbound>
+        <base />
+        <cors allow-credentials="false">
+            <allowed-origins>
+                <origin>https://blue-cliff-0b313850f.5.azurestaticapps.net</origin>
+            </allowed-origins>
+            <allowed-methods>
+                <method>GET</method>
+                <method>POST</method>
+            </allowed-methods>
+            <allowed-headers>
+                <header>Authorization</header>
+                <header>Content-Type</header>
+            </allowed-headers>
+        </cors>
+        <validate-jwt header-name="Authorization" failed-validation-httpcode="401" failed-validation-error-message="Invalid or missing token" output-token-variable-name="jwt">
+            <openid-config url="https://login.microsoftonline.com/b1e769c7-78fc-4eb9-a371-2c14cbcc07af/v2.0/.well-known/openid-configuration" />
+            <audiences>
+                <audience>api://5fcba1ce-8186-4dbb-9b35-e2f07ee74db6</audience>
+                <audience>5fcba1ce-8186-4dbb-9b35-e2f07ee74db6</audience>
+            </audiences>
+            <issuers>
+                <issuer>https://login.microsoftonline.com/b1e769c7-78fc-4eb9-a371-2c14cbcc07af/v2.0</issuer>
+            </issuers>
+        </validate-jwt>
+        <!--
+          Data scope: members of restricted-data-viewers get the NY_FED-only container.
+          If the user is in too many groups, Entra omits the groups claim and sets _claim_names
+          instead ("groups overage"). Treat that as restricted so an overage can't silently grant full access.
+        -->
+        <set-header name="x-data-scope" exists-action="override">
+            <value>@{
+                var jwt = (Jwt)context.Variables["jwt"];
+                if (jwt.Claims.ContainsKey("_claim_names")) { return "restricted"; }
+                if (jwt.Claims.ContainsKey("groups") &&
+                    Array.IndexOf(jwt.Claims["groups"], "20245927-4db0-4696-8374-35c40a6bdd2a") >= 0) {
+                    return "restricted";
+                }
+                return "full";
+            }</value>
+        </set-header>
+        <!-- Proves to the backend that the request came through this gateway. Resolved from Key Vault. -->
+        <set-header name="x-apim-secret" exists-action="override">
+            <value>{{apim-backend-secret}}</value>
+        </set-header>
+        <!-- Backend no longer validates tokens; don't forward them. -->
+        <set-header name="Authorization" exists-action="delete" />
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>
