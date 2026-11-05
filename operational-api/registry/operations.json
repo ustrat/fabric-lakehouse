@@ -1,0 +1,95 @@
+{
+  "$comment": "Semantic registry: business operation -> the store that serves it. Metric DEFINITIONS live in Fabric (gold notebook + views); this file only routes. Endpoints/IDs are App Service setting NAMES, never values.",
+  "version": 1,
+  "stores": {
+    "retailCosmos": {
+      "type": "cosmos",
+      "endpointSetting": "RETAIL_COSMOS_ENDPOINT",
+      "database": "retail_cosmos"
+    },
+    "lakehouseSql": {
+      "type": "sqlEndpoint",
+      "serverSetting": "LAKEHOUSE_SQL_SERVER",
+      "database": "retail_ai_lh"
+    },
+    "retailDataAgent": {
+      "type": "dataAgent",
+      "mcpUrlSetting": "RETAIL_DATA_AGENT_MCP_URL"
+    },
+    "embeddings": {
+      "type": "azureOpenAI",
+      "endpointSetting": "OPENAI_ENDPOINT",
+      "deploymentSetting": "EMBEDDING_DEPLOYMENT"
+    }
+  },
+  "operations": [
+    {
+      "name": "get_product_rating",
+      "route": "GET /api/retail/products/:productId/rating",
+      "description": "Exact review count and average review stars for ONE product, looked up by productId. Use for 'what is the rating of <product>' after you know its productId.",
+      "store": "retailCosmos",
+      "handler": "cosmos.pointRead",
+      "container": "ProductSummary",
+      "key": "productId",
+      "fields": ["productId", "productName", "categoryName", "priceBand", "currentPrice", "reviewCount", "avgStars", "lastReviewDate", "refreshedAt"],
+      "definition": "avgStars = average of review stars, computed once in the gold notebook (gold_product_review_summary).",
+      "parameters": {
+        "type": "object",
+        "properties": { "productId": { "type": "string", "description": "The product's productId (GUID)." } },
+        "required": ["productId"]
+      }
+    },
+    {
+      "name": "search_products",
+      "route": "GET /api/retail/products/search",
+      "description": "Find products that match a need or description in natural language (e.g. 'quiet headphones for long flights'). Returns product names, productIds, category and price. Use mode 'hybrid' when the text contains brand names or model numbers.",
+      "store": "retailCosmos",
+      "handler": "cosmos.semanticSearch",
+      "container": "ProductSearch",
+      "vectorField": "embedding",
+      "textField": "description",
+      "embeddingStore": "embeddings",
+      "embeddingModel": "text-embedding-3-small",
+      "defaultMode": "vector",
+      "maxTop": 20,
+      "fields": ["productId", "name", "categoryName", "currentPrice"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "q": { "type": "string", "description": "What the user is looking for, in their own words." },
+          "mode": { "type": "string", "enum": ["vector", "hybrid"], "description": "vector = by meaning (default); hybrid = meaning + keyword match." },
+          "top": { "type": "integer", "minimum": 1, "maximum": 20, "description": "Number of results (default 5)." }
+        },
+        "required": ["q"]
+      }
+    },
+    {
+      "name": "get_rating_trends",
+      "route": "GET /api/retail/analytics/ratings",
+      "description": "Average review stars and review volume by category and price band (premium/standard), weighted by review count. Use for comparisons across many products, not single-product lookups.",
+      "store": "lakehouseSql",
+      "handler": "sql.namedQuery",
+      "object": "dbo.gold_product_review_summary",
+      "sql": "SELECT categoryName, priceBand, COUNT(*) AS products, CAST(SUM(reviewCount) AS int) AS reviews, CAST(SUM(avgStars * reviewCount) / NULLIF(SUM(reviewCount), 0) AS decimal(4,2)) AS avgStars FROM dbo.gold_product_review_summary WHERE reviewCount > 0 AND (@category IS NULL OR LOWER(categoryName) LIKE '%' + LOWER(@category) + '%') GROUP BY categoryName, priceBand ORDER BY avgStars ASC",
+      "sqlParams": { "category": "nvarchar" },
+      "definition": "Category average is weighted by review count (sum of stars / sum of reviews), not an average of product averages.",
+      "parameters": {
+        "type": "object",
+        "properties": { "category": { "type": "string", "description": "Optional partial category name, e.g. 'laptops'." } }
+      }
+    },
+    {
+      "name": "ask_data",
+      "route": "POST /api/retail/ask",
+      "description": "Free-form analytical questions about the product catalog and customer reviews: rankings, premium vs standard, what customers complain about. Slower (8-30s); prefer the specific operations when they fit.",
+      "store": "retailDataAgent",
+      "handler": "dataAgent.ask",
+      "identity": "user",
+      "parameters": {
+        "type": "object",
+        "properties": { "question": { "type": "string", "description": "The user's question, with any needed context from the conversation." } },
+        "required": ["question"]
+      }
+    }
+  ]
+}
