@@ -35,4 +35,4 @@ async function namedQuery(op, store, args, ctx) {
   return { body: { rows: result.recordset }, meta: { sqlMs: Date.now() - t0, source: op.object } };
 }
 
-module.exports = { namedQuery };
+module.exports = { namedQuery, poolFor };

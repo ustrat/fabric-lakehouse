@@ -6,6 +6,7 @@ const registry = require("../registry/operations.json");
 const cosmos = require("./cosmos");
 const sql = require("./sql");
 const dataAgent = require("./dataAgent");
+const { createCache } = require("./cache");
 
 const HANDLERS = {
   "cosmos.pointRead": cosmos.pointRead,
@@ -44,6 +45,14 @@ function createDal({ credential }) {
     return res.data[0].embedding;
   }
 
+  const caches = new Map();
+  function cacheFor(op, ctx) {
+    if (!caches.has(op.name)) {
+      caches.set(op.name, createCache({ store: registry.stores[op.cache.store], cacheCfg: op.cache, ctx }));
+    }
+    return caches.get(op.name);
+  }
+
   function validate(op, args) {
     const missing = (op.parameters.required || []).filter((p) => args[p] === undefined || args[p] === "");
     return missing.length ? `Missing required parameter(s): ${missing.join(", ")}` : null;
@@ -59,8 +68,37 @@ function createDal({ credential }) {
     const ctx = { ...reqCtx, credential, setting, embed };
     const t0 = Date.now();
     try {
+      // Semantic cache (registry: op.cache). Any cache failure falls through to a live call.
+      let cached = null;
+      const question = op.cache && String(args[op.cache.questionParam] || "");
+      if (op.cache) {
+        try {
+          cached = await cacheFor(op, ctx).lookup({ operation: name, question, access: reqCtx.access });
+          if (cached.hit) {
+            return {
+              status: 200,
+              body: { ...cached.entry.answer, cachedFrom: { question: cached.entry.question, at: cached.entry.createdAt } },
+              meta: { operation: name, store: op.cache.container, ms: Date.now() - t0, cache: "hit", similarity: cached.entry.similarity },
+            };
+          }
+        } catch (err) {
+          console.error(`Cache lookup for ${name} failed (serving live):`, err.message);
+          cached = null;
+        }
+      }
+
       const out = await HANDLERS[op.handler](op, registry.stores[op.store], args, ctx);
-      return { status: out.status || 200, body: out.body, meta: { operation: name, store: op.store, ms: Date.now() - t0, ...out.meta } };
+      const status = out.status || 200;
+      const meta = { operation: name, store: op.store, ms: Date.now() - t0, ...out.meta };
+      if (op.cache) {
+        meta.cache = cached ? "miss" : "bypass";
+        if (cached) meta.nearestSimilarity = cached.nearest;
+        if (cached && status === 200) {
+          cacheFor(op, ctx).save({ operation: name, question, answer: out.body, lookupResult: cached })
+            .catch((err) => console.error(`Cache save for ${name} failed:`, err.message));
+        }
+      }
+      return { status, body: out.body, meta };
     } catch (err) {
       console.error(`Operation ${name} failed:`, err.message);
       return { status: err.status || 502, body: { error: `${name} failed`, detail: err.message } };
