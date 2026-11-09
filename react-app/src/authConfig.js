@@ -17,4 +17,5 @@ export const apiRequest = {
 };
 
 // All calls go through APIM; the App Service rejects anything that didn't.
-export const API_BASE_URL = "https://ustrat-apim.azure-api.net/supply-chain";
+// Override per environment with VITE_API_BASE_URL.
+export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "https://ustrat-apim.azure-api.net/supply-chain";
