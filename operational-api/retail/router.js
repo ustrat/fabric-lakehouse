@@ -5,7 +5,9 @@ const express = require("express");
 
 function createRetailRouter({ dal, middleware = [] }) {
   const router = express.Router();
-  if (middleware.length) router.use(...middleware);
+  // Scope the gateway/access checks to this router's paths; app.use() runs a router for every request,
+  // so an unscoped router.use() would also lock /health and re-run checks on the app's own routes.
+  if (middleware.length) router.use("/api/retail", ...middleware);
 
   // APIM forwards the validated caller token in x-user-token (see docs/semantic-registry.md).
   const reqCtx = (req) => ({ userToken: req.headers["x-user-token"], access: req.access });
