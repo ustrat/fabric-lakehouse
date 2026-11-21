@@ -1,0 +1,114 @@
+{
+  "$comment": "KPI registry: the single authority for what every metric, dimension and business rule means. The gold SQL (registry/generated/*.sql), the API's metric queries and the AI tool descriptions are all generated from this file. Change a definition here, bump `version`, then run `node scripts/generate-registry-sql.js`. Never edit a definition anywhere else.",
+  "version": 1,
+
+  "rules": {
+    "premiumPriceThreshold": {
+      "value": 1000,
+      "description": "A product is 'premium' when its current price is at least this amount, otherwise 'standard'."
+    }
+  },
+
+  "models": {
+    "product_reviews": {
+      "description": "Product-grain gold table. Base measures are stored in additive form so any rollup is exact.",
+      "table": "gold_product_review_summary",
+      "sqlObject": "dbo.gold_product_review_summary",
+      "grain": "productId",
+      "from": "SampleData p LEFT JOIN SampleData r ON r.productId = p.productId AND r.docType = 'review'",
+      "where": "p.docType = 'product'",
+      "keys": {
+        "productId": { "build": "p.productId", "type": "string", "filters": ["eq"] }
+      }
+    }
+  },
+
+  "dimensions": {
+    "productName": {
+      "label": "Product name",
+      "model": "product_reviews",
+      "build": "p.name",
+      "groupBy": true,
+      "filters": ["eq", "contains"]
+    },
+    "categoryName": {
+      "label": "Category",
+      "synonyms": ["category", "product category", "department"],
+      "model": "product_reviews",
+      "build": "p.categoryName",
+      "groupBy": true,
+      "filters": ["eq", "contains"]
+    },
+    "currentPrice": {
+      "label": "Current price",
+      "model": "product_reviews",
+      "build": "p.currentPrice",
+      "groupBy": false,
+      "filters": []
+    },
+    "priceBand": {
+      "label": "Price band",
+      "synonyms": ["price tier", "premium vs standard", "tier"],
+      "model": "product_reviews",
+      "build": "CASE WHEN p.currentPrice >= {rule:premiumPriceThreshold} THEN 'premium' ELSE 'standard' END",
+      "values": ["premium", "standard"],
+      "groupBy": true,
+      "filters": ["eq"]
+    }
+  },
+
+  "measures": {
+    "reviewCount": {
+      "label": "Review count",
+      "synonyms": ["number of reviews", "review volume", "reviews"],
+      "description": "Number of customer reviews.",
+      "model": "product_reviews",
+      "build": "COUNT(r.id)",
+      "rollup": "SUM",
+      "type": "int",
+      "unit": "reviews"
+    },
+    "sumStars": {
+      "label": "Total stars",
+      "description": "Sum of review stars. A building block for avgStars; rarely meaningful on its own.",
+      "model": "product_reviews",
+      "build": "COALESCE(SUM(r.stars), 0)",
+      "rollup": "SUM",
+      "type": "number",
+      "internal": true
+    },
+    "reviewedProducts": {
+      "label": "Reviewed products",
+      "synonyms": ["products with reviews", "number of products"],
+      "description": "Number of products that have at least one review.",
+      "model": "product_reviews",
+      "rollupExpr": "SUM(CASE WHEN {col:reviewCount} > 0 THEN 1 ELSE 0 END)",
+      "type": "int",
+      "unit": "products"
+    }
+  },
+
+  "metrics": {
+    "avgStars": {
+      "label": "Average rating",
+      "synonyms": ["rating", "average stars", "review score", "stars", "customer rating"],
+      "description": "Average review stars on a 1-5 scale, weighted by review: total stars divided by total reviews. Never an average of product averages.",
+      "model": "product_reviews",
+      "numerator": "sumStars",
+      "denominator": "reviewCount",
+      "round": 2,
+      "store": true,
+      "unit": "stars (1-5)",
+      "owner": "retail-analytics",
+      "certified": true
+    }
+  },
+
+  "attributes": {
+    "lastReviewDate": {
+      "description": "Date of the product's most recent review.",
+      "model": "product_reviews",
+      "build": "MAX(CAST(r.reviewDate AS DATE))"
+    }
+  }
+}

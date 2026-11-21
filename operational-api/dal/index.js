@@ -6,6 +6,8 @@ const registry = require("../registry/operations.json");
 const cosmos = require("./cosmos");
 const sql = require("./sql");
 const dataAgent = require("./dataAgent");
+const metrics = require("./metrics");
+const kpi = require("../registry/kpi");
 const { createCache } = require("./cache");
 
 const HANDLERS = {
@@ -13,7 +15,13 @@ const HANDLERS = {
   "cosmos.semanticSearch": cosmos.semanticSearch,
   "sql.namedQuery": sql.namedQuery,
   "dataAgent.ask": dataAgent.ask,
+  "metrics.query": metrics.query,
+  "metrics.list": metrics.listMetrics,
+  "metrics.describe": metrics.describeMetric,
 };
+
+// Parameter schemas that are generated from the KPI registry instead of written by hand.
+const GENERATED_SCHEMAS = { "kpi.querySchema": kpi.querySchema };
 
 const operations = new Map(registry.operations.map((op) => [op.name, op]));
 
@@ -21,6 +29,14 @@ const operations = new Map(registry.operations.map((op) => [op.name, op]));
 for (const op of operations.values()) {
   if (!HANDLERS[op.handler]) throw new Error(`Registry operation '${op.name}' uses unknown handler '${op.handler}'`);
   if (!registry.stores[op.store]) throw new Error(`Registry operation '${op.name}' uses unknown store '${op.store}'`);
+  if (typeof op.parameters === "string") {
+    if (!GENERATED_SCHEMAS[op.parameters]) throw new Error(`Registry operation '${op.name}' uses unknown schema '${op.parameters}'`);
+    op.parameters = GENERATED_SCHEMAS[op.parameters]();
+  }
+  for (const id of op.metrics || []) {
+    if (!kpi.describe(id)) throw new Error(`Registry operation '${op.name}' references unknown metric '${id}'`);
+  }
+  if (op.query) kpi.compileQuery(op.query); // a fixed query must compile against the KPI registry
 }
 
 function setting(name) {
@@ -90,6 +106,16 @@ function createDal({ credential }) {
       const out = await HANDLERS[op.handler](op, registry.stores[op.store], args, ctx);
       const status = out.status || 200;
       const meta = { operation: name, store: op.store, ms: Date.now() - t0, ...out.meta };
+      // Every answer that carries a KPI says which registry definitions produced it. Precomputed docs
+      // (Cosmos) report their own stamp; a stamp that differs from the API's registry is flagged, not hidden.
+      if (op.metrics || op.query) {
+        const stamped = out.body && "registryHash" in out.body;
+        meta.registryVersion = stamped ? out.body.registryVersion : kpi.version;
+        meta.registryHash = stamped ? out.body.registryHash : kpi.definitionHash;
+        if (op.metrics && (!stamped || out.body.registryHash !== kpi.definitionHash)) {
+          meta.registryMismatch = stamped ? `built from registry ${out.body.registryHash}, API uses ${kpi.definitionHash}` : "document has no registry stamp";
+        }
+      }
       if (op.cache) {
         meta.cache = cached ? "miss" : "bypass";
         if (cached) meta.nearestSimilarity = cached.nearest;
@@ -107,15 +133,15 @@ function createDal({ credential }) {
 
   // OpenAI/Foundry function-tool format, generated from the same registry the routes use.
   function toolDefinitions() {
-    return [...operations.values()].map((op) => ({
-      type: "function",
-      name: op.name,
-      description: op.definition ? `${op.description} Definition: ${op.definition}` : op.description,
-      parameters: op.parameters,
-    }));
+    // Metric meanings come from the KPI registry, never from free text in operations.json.
+    return [...operations.values()].map((op) => {
+      const ids = op.metrics || op.query?.metrics || [];
+      const parts = [op.description, ids.length && `Definitions: ${kpi.definitionText(ids)}`, op.note];
+      return { type: "function", name: op.name, description: parts.filter(Boolean).join(" "), parameters: op.parameters };
+    });
   }
 
-  return { invoke, toolDefinitions, operations: [...operations.values()] };
+  return { invoke, toolDefinitions, operations: [...operations.values()], registryVersion: kpi.version };
 }
 
 module.exports = { createDal };

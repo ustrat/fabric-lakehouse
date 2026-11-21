@@ -2,9 +2,40 @@
 
 How the app and the AI decide which store answers a question.
 
-- **Fabric owns what the numbers mean.** The gold notebook (`gold_product_review_summary`) computes the metrics, and the views and the Data Agent read the same definitions.
-- **`operational-api/registry/operations.json` owns where each answer is fetched from.** It maps business operations to stores and is reviewed in PRs.
-- **App Service settings own environment values.** The registry holds setting *names*, never endpoints or secrets.
+- **The KPI registry owns what the numbers mean.** `operational-api/registry/metrics.json` is the single authority for every metric, dimension and business rule (for example, the premium price threshold). Fabric runs SQL *generated* from it; nothing else defines a metric.
+- **`operational-api/registry/operations.json` owns where each answer is fetched from.** It maps business operations to stores, references metrics by id and never restates a formula.
+- **App Service settings own environment values.** The registries hold setting *names*, never endpoints or secrets.
+
+```text
+registry/metrics.json ──generate──▶ registry/generated/gold_*.sql/.json ──upload──▶ Files/registry/ ──▶ gold notebook ──▶ gold table ──▶ Cosmos ProductSummary
+        │
+        └──compile at request time──▶ query_metric / get_rating_trends (T-SQL on the gold table)
+        └──describe────────────────▶ list_metrics / describe_metric / tool descriptions
+```
+
+## KPI registry
+
+| Section | Holds |
+|---|---|
+| `rules` | Business constants used by dimensions, e.g. `premiumPriceThreshold` |
+| `models` | A gold table: its grain, source join and SQL endpoint object |
+| `dimensions` | How each one is built, and whether it can be grouped or filtered (`eq`, `contains`) |
+| `measures` | Additive base values stored on gold (`reviewCount`, `sumStars`), or query-time rollups (`reviewedProducts`) |
+| `metrics` | Ratios of measures (`avgStars = sumStars / reviewCount`), always recomputed from the sums at the requested grain, so a rollup is never an average of averages |
+
+Every gold row and Cosmos doc carries `registryVersion` and `registryHash`, and every API answer that carries a metric returns them in `_meta`, plus the definitions in the body for metric queries.
+
+### Changing a definition
+
+1. Edit `registry/metrics.json` and bump `version`.
+2. `node scripts/generate-registry-sql.js --upload` regenerates `registry/generated/*`, which you commit, and uploads it to `retail_ai_lh` `Files/registry/`.
+3. Run `sync_gold_to_cosmos`. If the gold schema changed, it rewrites gold and fully resyncs Cosmos. The SQL analytics endpoint can take a few minutes to show new columns; until then queries fail with "Invalid column name".
+4. Run `node jobs/precompute-insights.js` so ProductInsights carries the new stamp. If some products fail on rate limits (429), rerun with `--stale` to redo only those.
+5. Deploy the API, then run `node scripts/smoke-registry.js`. Its drift checks fail if Cosmos, gold and `query_metric` disagree, or if Cosmos docs were built from a different registry version.
+
+In CI, `node scripts/generate-registry-sql.js --check` fails when the generated files are stale.
+
+**Deploy order matters:** the gold table must be rebuilt (step 3) before an API that queries `sumStars` is deployed.
 
 ```
 React screen ──REST──┐                       ┌─ get_product_rating ─▶ Cosmos ProductSummary (point read, 1 RU)
@@ -17,8 +48,13 @@ AI agent ─tools──────┘                       ├─ get_rating_t
 
 | Path | Purpose |
 |---|---|
+| `operational-api/registry/metrics.json` | KPI registry: the only place metrics, dimensions and rules are defined |
+| `operational-api/registry/kpi.js` | Validates the KPI registry; compiles gold Spark SQL and metric T-SQL; describes metrics for the AI |
+| `operational-api/registry/generated/` | Generated gold SQL and manifest. Do not edit |
+| `operational-api/scripts/generate-registry-sql.js` | Writes/checks/uploads the generated files |
+| `operational-api/dal/metrics.js` | `query`, `listMetrics`, `describeMetric` handlers |
 | `operational-api/registry/operations.json` | Each operation's route, store, handler, AI tool description and parameter schema |
-| `operational-api/dal/index.js` | Loads the registry and checks it at startup. `invoke(name, args)`, `toolDefinitions()` |
+| `operational-api/dal/index.js` | Loads both registries and checks them at startup. `invoke(name, args)`, `toolDefinitions()` |
 | `operational-api/dal/cosmos.js` | `pointRead`, `semanticSearch` (vector or hybrid RRF) |
 | `operational-api/dal/sql.js` | `namedQuery`: runs only the parameterized SQL in the registry |
 | `operational-api/dal/dataAgent.js` | `ask`: calls the Fabric Data Agent MCP endpoint on behalf of the caller |
@@ -27,8 +63,8 @@ AI agent ─tools──────┘                       ├─ get_rating_t
 
 ## Adding a use case
 
-1. Make sure the metric exists in Fabric (the gold table or a view). Don't calculate it in Node.
-2. Add an entry to `operations.json`: `name`, `route`, `description` (the AI reads this), `store`, `handler`, store-specific fields and `parameters`.
+1. If it needs a new number, define it in `registry/metrics.json` (see *Changing a definition*). It is then immediately available through `query_metric`. Don't calculate metrics in Node or in a notebook by hand.
+2. Add an operation only if the app needs a fixed endpoint or a non-metric store. For a fixed metric view, use `handler: "metrics.query"` with a `query` spec, as `get_rating_trends` does. Otherwise add an entry to `operations.json`: `name`, `route`, `description` (the AI reads this), `store`, `handler`, store-specific fields and `parameters`.
 3. If the store type is new, add a handler in `dal/` and register it in `HANDLERS`.
 4. Run `node scripts/smoke-registry.js`.
 
@@ -78,6 +114,9 @@ Long agent calls can take 8 to 30 seconds. Check that the APIM `forward-request`
 Cold-start times include getting tokens and opening connections. Warm calls skip both, because the clients and SQL pools are cached.
 
 ## Known gaps
+
+- **Still defined outside the registry:** the `priceBand` CASE in the SQL views `vw_products` (Fabric only, not in the repo), and the Fabric Data Agent's instructions. `ask_data` answers are therefore *not* registry-governed; its tool description tells the AI to use `query_metric` for any listed metric. Next steps: generate the views and the Data Agent instructions from the registry.
+- The answer cache key does not include `registryVersion` yet. Until it does, bump `dataVersion` (the gold sync does this on any change) after a definition change.
 
 - The retail data has no row-level restrictions yet. The routes still require `requireGateway` and `resolveAccess`, but nothing filters by group.
 - `ask_data` opens a new MCP session on every call. If latency matters, add session reuse and MCP *tasks* for long questions.

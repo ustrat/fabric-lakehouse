@@ -76,16 +76,20 @@ function Overview({ onExample }) {
 
   useEffect(() => {
     const ctrl = new AbortController();
-    api("/api/retail/analytics/ratings", { signal: ctrl.signal })
-      .then(({ data, meta }) => setState({ status: "done", rows: data.rows, meta }))
+    // Totals come from the KPI registry (query_metric), never recomputed here from rounded group averages.
+    Promise.all([
+      api("/api/retail/analytics/ratings", { signal: ctrl.signal }),
+      api("/api/retail/metrics/query", { method: "POST", signal: ctrl.signal, body: { metrics: ["reviewedProducts", "reviewCount", "avgStars"] } }),
+    ])
+      .then(([trends, totals]) => setState({ status: "done", rows: trends.data.rows, total: totals.data.rows?.[0], meta: trends.meta }))
       .catch((err) => err.name !== "AbortError" && setState({ status: "error" }));
     return () => ctrl.abort();
   }, [api]);
 
   const rows = state.rows || [];
-  const products = rows.reduce((s, r) => s + r.products, 0);
-  const reviews = rows.reduce((s, r) => s + r.reviews, 0);
-  const avg = reviews ? rows.reduce((s, r) => s + r.avgStars * r.reviews, 0) / reviews : null;
+  const products = state.total?.reviewedProducts ?? 0;
+  const reviews = state.total?.reviewCount ?? 0;
+  const avg = state.total?.avgStars != null ? Number(state.total.avgStars) : null;
   const lowest = rows[0]; // query orders by avgStars ascending
 
   return (

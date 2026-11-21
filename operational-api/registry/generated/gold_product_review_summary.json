@@ -1,0 +1,23 @@
+{
+  "$comment": "GENERATED from registry/metrics.json by scripts/generate-registry-sql.js. Do not edit.",
+  "model": "product_reviews",
+  "table": "gold_product_review_summary",
+  "registryVersion": 1,
+  "registryHash": "0f955de45c809c38",
+  "keys": [
+    "productId"
+  ],
+  "businessColumns": [
+    "productName",
+    "categoryName",
+    "currentPrice",
+    "priceBand",
+    "reviewCount",
+    "sumStars",
+    "avgStars",
+    "lastReviewDate",
+    "registryVersion",
+    "registryHash"
+  ],
+  "sql": "-- GENERATED from operational-api/registry/metrics.json by scripts/generate-registry-sql.js. Do not edit.\n-- registryVersion=1 registryHash=0f955de45c809c38 model=product_reviews table=gold_product_review_summary\nSELECT\n    p.productId AS productId,\n    p.name AS productName,\n    p.categoryName AS categoryName,\n    p.currentPrice AS currentPrice,\n    CASE WHEN p.currentPrice >= 1000 THEN 'premium' ELSE 'standard' END AS priceBand,\n    COUNT(r.id) AS reviewCount,\n    COALESCE(SUM(r.stars), 0) AS sumStars,\n    ROUND(COALESCE(SUM(r.stars), 0) / NULLIF(COUNT(r.id), 0), 2) AS avgStars,\n    MAX(CAST(r.reviewDate AS DATE)) AS lastReviewDate,\n    1 AS registryVersion,\n    '0f955de45c809c38' AS registryHash,\n    current_timestamp() AS refreshedAt\nFROM SampleData p LEFT JOIN SampleData r ON r.productId = p.productId AND r.docType = 'review'\nWHERE p.docType = 'product'\nGROUP BY p.productId, p.name, p.categoryName, p.currentPrice, CASE WHEN p.currentPrice >= 1000 THEN 'premium' ELSE 'standard' END\n"
+}

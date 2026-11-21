@@ -95,6 +95,16 @@ export async function mockFetch(path, { method, body, signal }) {
     };
   }
 
+  if (url.pathname === "/api/retail/metrics/query" && method === "POST") {
+    await wait(300, signal);
+    const reviews = TRENDS.reduce((s, r) => s + r.reviews, 0);
+    const stars = TRENDS.reduce((s, r) => s + r.avgStars * r.reviews, 0); // mock only: real totals come from gold sums
+    return {
+      data: { rows: [{ reviewedProducts: TRENDS.reduce((s, r) => s + r.products, 0), reviewCount: reviews, avgStars: Math.round((stars / reviews) * 100) / 100 }] },
+      meta: { operation: "query_metric", store: "lakehouseSql", ms: Math.round(performance.now() - t0), registryVersion: 1 },
+    };
+  }
+
   if (url.pathname === "/api/retail/ask" && method === "POST") {
     const key = norm(body.question);
     const hit = askCache.get(key);

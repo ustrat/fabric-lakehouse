@@ -8,7 +8,8 @@
 //   4. A new dataVersion is written last, which invalidates the semantic answer cache.
 //
 // Run after the gold refresh (schedule alongside the gold notebook).
-// Usage (from operational-api/):  node jobs/precompute-insights.js [--limit N]
+// Usage (from operational-api/):  node jobs/precompute-insights.js [--limit N] [--stale]
+//   --stale  only redo products with no doc, a different registry hash, or changed KPI values (e.g. after 429s).
 require("../scripts/dev-settings");
 const { CosmosClient } = require("@azure/cosmos");
 const { DefaultAzureCredential, getBearerTokenProvider } = require("@azure/identity");
@@ -30,6 +31,7 @@ const MODEL = setting("CHAT_DEPLOYMENT");
 const SENTIMENTS = new Set(["complaint", "praise", "mixed"]);
 const limitArg = process.argv.indexOf("--limit");
 const LIMIT = limitArg > 0 ? parseInt(process.argv[limitArg + 1], 10) : Infinity;
+const STALE_ONLY = process.argv.includes("--stale");
 
 const SYSTEM = `You group customer reviews of ONE product into themes.
 Return JSON only: {"themes":[{"label":"<max 6 words>","sentiment":"complaint|praise|mixed","reviews":[<indices>]}]}
@@ -80,6 +82,9 @@ function buildDoc(product, labeled, version) {
     productName: product.productName,
     reviewCount: product.reviewCount,
     avgStars: product.avgStars,
+    // KPI values are copied from gold, so the doc carries gold's registry stamp.
+    registryVersion: product.registryVersion,
+    registryHash: product.registryHash,
     themes,
     // Deterministic summary (no model text): built from the counted themes.
     summary: `${top.count} of ${total} reviews: "${top.label}" (${top.sentiment}).`,
@@ -106,14 +111,26 @@ async function mapLimit(items, n, fn) {
     FROM dbo.vw_reviews r
     GROUP BY r.productId, r.reviewText`);
   const { recordset: gold } = await pool.request().query(`
-    SELECT productId, productName, reviewCount, avgStars FROM dbo.gold_product_review_summary WHERE reviewCount > 0`);
+    SELECT productId, productName, reviewCount, avgStars, registryVersion, registryHash
+    FROM dbo.gold_product_review_summary WHERE reviewCount > 0`);
 
   // SQL COUNT/bigint arrive as strings from the mssql driver; normalize before any arithmetic.
   const byProduct = new Map(gold.map((g) => [g.productId, {
     ...g, reviewCount: Number(g.reviewCount), avgStars: g.avgStars === null ? null : Number(g.avgStars), texts: [],
   }]));
   for (const r of rows) byProduct.get(r.productId)?.texts.push({ text: r.reviewText, n: Number(r.n), stars: r.stars });
-  const products = [...byProduct.values()].filter((p) => p.texts.length).slice(0, LIMIT);
+  let products = [...byProduct.values()].filter((p) => p.texts.length);
+  if (STALE_ONLY) {
+    // Skip products whose doc already matches gold: same registry hash and the same KPI values.
+    const { resources: docs } = await insights.items
+      .query("SELECT c.productId, c.registryHash, c.reviewCount, c.avgStars FROM c").fetchAll();
+    const current = new Map(docs.map((d) => [d.productId, d]));
+    products = products.filter((p) => {
+      const d = current.get(p.productId);
+      return !d || d.registryHash !== p.registryHash || d.reviewCount !== p.reviewCount || d.avgStars !== p.avgStars;
+    });
+  }
+  products = products.slice(0, LIMIT);
   console.log(`Products with reviews: ${products.length} (from ${rows.length} distinct review texts)`);
 
   let ok = 0, fallback = 0, failed = 0, ru = 0;
