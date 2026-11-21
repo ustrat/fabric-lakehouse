@@ -49,7 +49,15 @@
         <set-header name="x-apim-secret" exists-action="override">
             <value>{{apim-backend-secret}}</value>
         </set-header>
-        <!-- Backend no longer validates tokens; don't forward them. -->
+        <!--
+          Forward the already-validated caller token so ask_data can call the Fabric Data Agent on the user's
+          behalf (On-Behalf-Of). The backend uses it only together with x-apim-secret. Overrides any
+          client-supplied value.
+        -->
+        <set-header name="x-user-token" exists-action="override">
+            <value>@(context.Request.Headers.GetValueOrDefault("Authorization","").Replace("Bearer ",""))</value>
+        </set-header>
+        <!-- The backend doesn't validate Authorization itself; it reads the token from x-user-token above. -->
         <set-header name="Authorization" exists-action="delete" />
     </inbound>
     <backend>
