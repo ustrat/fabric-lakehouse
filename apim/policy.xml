@@ -61,7 +61,8 @@
         <set-header name="Authorization" exists-action="delete" />
     </inbound>
     <backend>
-        <base />
+        <!-- ask_data calls to the Fabric Data Agent take 8-30 s; allow 60 s before APIM gives up. -->
+        <forward-request timeout="60" />
     </backend>
     <outbound>
         <base />
