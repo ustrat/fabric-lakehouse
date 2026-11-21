@@ -1,0 +1,155 @@
+{
+  "$comment": "Operations registry: business operation -> the store that serves it. It only ROUTES. What every metric means is defined once in registry/metrics.json (the KPI registry, the single authority); operations reference metrics by id and never restate a formula. Endpoints/IDs are App Service setting NAMES, never values.",
+  "version": 2,
+  "stores": {
+    "kpiRegistry": {
+      "type": "registry",
+      "file": "registry/metrics.json"
+    },
+    "retailCosmos": {
+      "type": "cosmos",
+      "endpointSetting": "RETAIL_COSMOS_ENDPOINT",
+      "database": "retail_cosmos"
+    },
+    "lakehouseSql": {
+      "type": "sqlEndpoint",
+      "serverSetting": "LAKEHOUSE_SQL_SERVER",
+      "database": "retail_ai_lh"
+    },
+    "retailDataAgent": {
+      "type": "dataAgent",
+      "mcpUrlSetting": "RETAIL_DATA_AGENT_MCP_URL"
+    },
+    "embeddings": {
+      "type": "azureOpenAI",
+      "endpointSetting": "OPENAI_ENDPOINT",
+      "deploymentSetting": "EMBEDDING_DEPLOYMENT"
+    }
+  },
+  "operations": [
+    {
+      "name": "get_product_rating",
+      "route": "GET /api/retail/products/:productId/rating",
+      "description": "Exact review count and average review stars for ONE product, looked up by productId. Use for 'what is the rating of <product>' after you know its productId.",
+      "store": "retailCosmos",
+      "handler": "cosmos.pointRead",
+      "container": "ProductSummary",
+      "key": "productId",
+      "fields": ["productId", "productName", "categoryName", "priceBand", "currentPrice", "reviewCount", "avgStars", "lastReviewDate", "registryVersion", "registryHash", "refreshedAt"],
+      "metrics": ["reviewCount", "avgStars"],
+      "parameters": {
+        "type": "object",
+        "properties": { "productId": { "type": "string", "description": "The product's productId (GUID)." } },
+        "required": ["productId"]
+      }
+    },
+    {
+      "name": "get_product_insights",
+      "route": "GET /api/retail/products/:productId/insights",
+      "description": "What customers say about ONE product: pre-computed review themes with exact counts and verbatim quotes. Use for 'what do customers think of / complain about <product>' once you know its productId.",
+      "store": "retailCosmos",
+      "handler": "cosmos.pointRead",
+      "container": "ProductInsights",
+      "key": "productId",
+      "fields": ["productId", "productName", "reviewCount", "avgStars", "themes", "summary", "generatedAt", "dataVersion", "registryVersion", "registryHash"],
+      "metrics": ["reviewCount", "avgStars"],
+      "note": "Themes are labeled by a model; every count comes from SQL and every quote is a verbatim reviewText (validated by jobs/precompute-insights.js).",
+      "parameters": {
+        "type": "object",
+        "properties": { "productId": { "type": "string", "description": "The product's productId (GUID)." } },
+        "required": ["productId"]
+      }
+    },
+    {
+      "name": "search_products",
+      "route": "GET /api/retail/products/search",
+      "description": "Find products that match a need or description in natural language (e.g. 'quiet headphones for long flights'). Returns product names, productIds, category and price. Use mode 'hybrid' when the text contains brand names or model numbers.",
+      "store": "retailCosmos",
+      "handler": "cosmos.semanticSearch",
+      "container": "ProductSearch",
+      "vectorField": "embedding",
+      "textField": "description",
+      "embeddingStore": "embeddings",
+      "embeddingModel": "text-embedding-3-small",
+      "defaultMode": "vector",
+      "maxTop": 20,
+      "fields": ["productId", "name", "categoryName", "currentPrice"],
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "q": { "type": "string", "description": "What the user is looking for, in their own words." },
+          "mode": { "type": "string", "enum": ["vector", "hybrid"], "description": "vector = by meaning (default); hybrid = meaning + keyword match." },
+          "top": { "type": "integer", "minimum": 1, "maximum": 20, "description": "Number of results (default 5)." }
+        },
+        "required": ["q"]
+      }
+    },
+    {
+      "name": "get_rating_trends",
+      "route": "GET /api/retail/analytics/ratings",
+      "description": "Average review stars and review volume by category and price band (premium/standard), weighted by review count. Use for comparisons across many products, not single-product lookups.",
+      "store": "lakehouseSql",
+      "handler": "metrics.query",
+      "query": {
+        "metrics": ["reviewedProducts", "reviewCount", "avgStars"],
+        "groupBy": ["categoryName", "priceBand"],
+        "orderBy": [{ "field": "avgStars", "dir": "asc" }]
+      },
+      "filterParams": { "category": { "dimension": "categoryName", "op": "contains" } },
+      "aliases": { "reviewedProducts": "products", "reviewCount": "reviews" },
+      "parameters": {
+        "type": "object",
+        "properties": { "category": { "type": "string", "description": "Optional partial category name, e.g. 'laptops'." } }
+      }
+    },
+    {
+      "name": "list_metrics",
+      "route": "GET /api/retail/metrics",
+      "description": "List every business metric (KPI) with its id, meaning and synonyms. Call this first when a question asks for a number you have no specific operation for.",
+      "store": "kpiRegistry",
+      "handler": "metrics.list",
+      "parameters": { "type": "object", "properties": {} }
+    },
+    {
+      "name": "describe_metric",
+      "route": "GET /api/retail/metrics/:metric",
+      "description": "Full definition of ONE metric: formula, unit, the dimensions it can be broken down or filtered by, allowed values, and the business rules behind those dimensions (e.g. the premium price threshold).",
+      "store": "kpiRegistry",
+      "handler": "metrics.describe",
+      "parameters": {
+        "type": "object",
+        "properties": { "metric": { "type": "string", "description": "Metric id from list_metrics." } },
+        "required": ["metric"]
+      }
+    },
+    {
+      "name": "query_metric",
+      "route": "POST /api/retail/metrics/query",
+      "description": "Compute one or more metrics, optionally broken down by dimensions and filtered. The definitions are fixed by the KPI registry, so report the numbers as returned and do not recompute them (for example, never average the averages). Prefer this over ask_data for any question that list_metrics covers.",
+      "store": "lakehouseSql",
+      "handler": "metrics.query",
+      "parameters": "kpi.querySchema"
+    },
+    {
+      "name": "ask_data",
+      "route": "POST /api/retail/ask",
+      "description": "Free-form analytical questions about the product catalog and customer reviews that no other operation or registry metric covers. Slower (8-30s). Its answers are NOT computed from the KPI registry, so never use it for a metric that list_metrics returns.",
+      "store": "retailDataAgent",
+      "handler": "dataAgent.ask",
+      "identity": "user",
+      "cache": {
+        "store": "retailCosmos",
+        "container": "AnswerCache",
+        "questionParam": "question",
+        "embeddingStore": "embeddings",
+        "similarityThreshold": 0.95,
+        "ttlSeconds": 86400
+      },
+      "parameters": {
+        "type": "object",
+        "properties": { "question": { "type": "string", "description": "The user's question, with any needed context from the conversation." } },
+        "required": ["question"]
+      }
+    }
+  ]
+}

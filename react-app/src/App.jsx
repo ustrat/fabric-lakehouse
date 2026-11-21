@@ -1,193 +1,110 @@
-import { useState, useCallback } from "react";
-import { useMsal, useIsAuthenticated, AuthenticatedTemplate, UnauthenticatedTemplate } from "@azure/msal-react";
-import { InteractionRequiredAuthError } from "@azure/msal-browser";
-import { apiRequest, API_BASE_URL } from "./authConfig";
+import { useEffect, useState } from "react";
+import { useMsal, AuthenticatedTemplate, UnauthenticatedTemplate } from "@azure/msal-react";
+import { apiRequest } from "./authConfig";
+import { DEMO } from "./api";
+import Products from "./pages/Products";
+import Analytics from "./pages/Analytics";
+import SupplyChain from "./pages/SupplyChain";
+import Assistant from "./components/Assistant";
+import Icon from "./components/Icon";
+import "./styles.css";
+
+const PAGES = [
+  { id: "products", label: "Products", icon: "products" },
+  { id: "analytics", label: "Rating trends", icon: "trends" },
+  { id: "supply", label: "Supply chain", icon: "supply" },
+];
 
 function SignInScreen() {
   const { instance } = useMsal();
   return (
-    <div style={styles.centered}>
-      <h1>Uprise Strategy Operational Dashboard</h1>
-      <p>Sign in with your organizational account to continue.</p>
-      <button style={styles.button} onClick={() => instance.loginPopup(apiRequest)}>
-        Sign in with Microsoft
-      </button>
+    <div className="signin">
+      <div className="card">
+        <div className="brand-mark" style={{ margin: "0 auto", width: 40, height: 40, fontSize: 18 }}>U</div>
+        <h1>Uprise Strategy Operations</h1>
+        <p className="muted" style={{ margin: 0 }}>Sign in with your work account to continue.</p>
+        <button className="btn btn-primary" style={{ justifyContent: "center" }} onClick={() => instance.loginPopup(apiRequest)}>
+          Sign in with Microsoft
+        </button>
+      </div>
     </div>
   );
 }
 
-function useApiToken() {
+function Workspace() {
   const { instance, accounts } = useMsal();
+  const [page, setPage] = useState("products");
+  const [product, setProduct] = useState(null);
+  const [known, setKnown] = useState([]); // products seen in search results; lets AI answers link to them
+  const remember = (list) => setKnown((prev) => {
+    const byId = new Map(prev.map((p) => [p.productId, p]));
+    list.forEach((p) => byId.set(p.productId, { productId: p.productId, name: p.name }));
+    return [...byId.values()];
+  });
+  const openProduct = (p) => { setProduct(p); setPage("products"); };
 
-  return useCallback(async () => {
-    const account = accounts[0];
-    try {
-      const result = await instance.acquireTokenSilent({ ...apiRequest, account });
-      return result.accessToken;
-    } catch (err) {
-      if (err instanceof InteractionRequiredAuthError) {
-        const result = await instance.acquireTokenPopup(apiRequest);
-        return result.accessToken;
+  // Keyboard: "/" search products, Ctrl/Cmd+K ask the data, Esc closes the assistant.
+  useEffect(() => {
+    const focusSoon = (id) => setTimeout(() => document.getElementById(id)?.focus(), 0); // after React renders the target
+    const onKey = (e) => {
+      const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable;
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setAssistantOpen(true);
+        focusSoon("ask");
+      } else if (e.key === "/" && !typing) {
+        e.preventDefault();
+        setPage("products");
+        focusSoon("product-q");
+      } else if (e.key === "Escape" && (!typing || e.target.id === "ask")) {
+        setAssistantOpen(false);
       }
-      throw err;
-    }
-  }, [instance, accounts]);
-}
-
-function Dashboard() {
-  const getToken = useApiToken();
-  const [indicators, setIndicators] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
-
-  const loadIndicators = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const token = await getToken();
-      const resp = await fetch(`${API_BASE_URL}/api/indicators`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!resp.ok) throw new Error(`API returned ${resp.status}`);
-      setIndicators(await resp.json());
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  }, [getToken]);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  const [assistantOpen, setAssistantOpen] = useState(window.innerWidth > 1180);
+  const name = DEMO ? "Demo user" : accounts[0]?.name || accounts[0]?.username;
 
   return (
-    <div style={styles.panel}>
-      <h2>Supply Chain Dashboard</h2>
-      <button style={styles.button} onClick={loadIndicators} disabled={loading}>
-        {loading ? "Loading..." : "Refresh indicators"}
-      </button>
-      {error && <p style={styles.error}>{error}</p>}
-      {indicators && (
-        <table style={styles.table}>
-          <thead>
-            <tr>
-              <th>Series</th>
-              <th>Metric</th>
-              <th>Value</th>
-              <th>As of</th>
-              <th>Source</th>
-            </tr>
-          </thead>
-          <tbody>
-            {indicators.map((row) => (
-              <tr key={row.series_id}>
-                <td>{row.series_id}</td>
-                <td>{row.metric_name}</td>
-                <td>{row.value}</td>
-                <td>{row.observation_date}</td>
-                <td>{row.source}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+    <div className={`shell ${assistantOpen ? "" : "no-assistant"}`}>
+      <nav className="sidebar" aria-label="Main">
+        <div className="brand"><span className="brand-mark">U</span><span>Operations</span></div>
+        {PAGES.map((p) => (
+          <button key={p.id} className="nav-item" aria-current={page === p.id ? "page" : undefined} onClick={() => setPage(p.id)}>
+            <Icon name={p.icon} />{p.label}
+          </button>
+        ))}
+        {!assistantOpen && (
+          <button className="nav-item" onClick={() => setAssistantOpen(true)}><Icon name="sparkle" />Ask the data</button>
+        )}
+        <div className="sidebar-foot">
+          {DEMO && <span className="chip accent" style={{ justifySelf: "start" }}>Demo data</span>}
+          <span>{name}</span>
+          {!DEMO && <button className="link" style={{ justifySelf: "start", fontSize: 12 }} onClick={() => instance.logoutPopup()}>Sign out</button>}
+        </div>
+      </nav>
+
+      <main className="main">
+        {page === "products" && <Products selected={product} onSelect={setProduct} onResults={remember} />}
+        {page === "analytics" && <Analytics />}
+        {page === "supply" && <SupplyChain />}
+      </main>
+
+      {assistantOpen && (
+        <Assistant context={page === "products" ? product : null} products={known} onOpenProduct={openProduct}
+          onClose={() => setAssistantOpen(false)} />
       )}
     </div>
   );
 }
 
-function Chat() {
-  const getToken = useApiToken();
-  const [message, setMessage] = useState("");
-  const [reply, setReply] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
-
-  const sendMessage = useCallback(
-    async (e) => {
-      e.preventDefault();
-      if (!message.trim()) return;
-      setLoading(true);
-      setError(null);
-      setReply(null);
-      try {
-        const token = await getToken();
-        const resp = await fetch(`${API_BASE_URL}/api/chat`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify({ message }),
-        });
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.error || `API returned ${resp.status}`);
-        setReply(data.reply);
-      } catch (err) {
-        setError(err.message);
-      } finally {
-        setLoading(false);
-      }
-    },
-    [message, getToken]
-  );
-
-  return (
-    <div style={styles.panel}>
-      <h2>Ask about the data</h2>
-      <form onSubmit={sendMessage} style={styles.chatForm}>
-        <input
-          style={styles.input}
-          value={message}
-          onChange={(e) => setMessage(e.target.value)}
-          placeholder="e.g. What is the current GSCPI value?"
-        />
-        <button style={styles.button} type="submit" disabled={loading}>
-          {loading ? "Asking..." : "Ask"}
-        </button>
-      </form>
-      {error && <p style={styles.error}>{error}</p>}
-      {reply && <p style={styles.reply}>{reply}</p>}
-    </div>
-  );
-}
-
-function UserBadge() {
-  const { instance, accounts } = useMsal();
-  const name = accounts[0]?.name || accounts[0]?.username || "signed in user";
-  return (
-    <div style={styles.userBar}>
-      <span>Signed in as {name}</span>
-      <button style={styles.linkButton} onClick={() => instance.logoutPopup()}>
-        Sign out
-      </button>
-    </div>
-  );
-}
-
 export default function App() {
-  const isAuthenticated = useIsAuthenticated();
-
+  if (DEMO) return <Workspace />;
   return (
-    <div style={styles.app}>
-      <UnauthenticatedTemplate>
-        <SignInScreen />
-      </UnauthenticatedTemplate>
-      <AuthenticatedTemplate>
-        <UserBadge />
-        <Dashboard />
-        <Chat />
-      </AuthenticatedTemplate>
-    </div>
+    <>
+      <UnauthenticatedTemplate><SignInScreen /></UnauthenticatedTemplate>
+      <AuthenticatedTemplate><Workspace /></AuthenticatedTemplate>
+    </>
   );
 }
-
-const styles = {
-  app: { fontFamily: "system-ui, sans-serif", maxWidth: 900, margin: "0 auto", padding: 24 },
-  centered: { textAlign: "center", marginTop: 80 },
-  panel: { border: "1px solid #ddd", borderRadius: 8, padding: 20, marginTop: 20 },
-  button: { padding: "8px 16px", borderRadius: 6, border: "1px solid #444", background: "#222", color: "#fff", cursor: "pointer" },
-  linkButton: { background: "none", border: "none", color: "#0066cc", cursor: "pointer", textDecoration: "underline" },
-  userBar: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid #eee" },
-  table: { width: "100%", borderCollapse: "collapse", marginTop: 16 },
-  error: { color: "#c0392b" },
-  reply: { marginTop: 12, padding: 12, background: "#f5f5f5", borderRadius: 6, whiteSpace: "pre-wrap" },
-  chatForm: { display: "flex", gap: 8 },
-  input: { flex: 1, padding: 8, borderRadius: 6, border: "1px solid #ccc" },
-};

@@ -29,30 +29,40 @@
             </issuers>
         </validate-jwt>
         <!--
-          Data scope: members of restricted-data-viewers get the NY_FED-only container.
-          If the user is in too many groups, Entra omits the groups claim and sets _claim_names
-          instead ("groups overage"). Treat that as restricted so an overage can't silently grant full access.
+          Forward the caller's validated group IDs. Which groups are restricted, and to which rows, is
+          decided by the Lakehouse's OneLake data access roles (synced to Cosmos) - not by this policy.
+          If the user is in too many groups, Entra omits the groups claim and sets _claim_names instead
+          ("groups overage"); send "overage" so the backend refuses rather than treating it as no groups.
+          Overrides any client-supplied value.
         -->
-        <set-header name="x-data-scope" exists-action="override">
+        <set-header name="x-caller-groups" exists-action="override">
             <value>@{
                 var jwt = (Jwt)context.Variables["jwt"];
-                if (jwt.Claims.ContainsKey("_claim_names")) { return "restricted"; }
-                if (jwt.Claims.ContainsKey("groups") &&
-                    Array.IndexOf(jwt.Claims["groups"], "20245927-4db0-4696-8374-35c40a6bdd2a") >= 0) {
-                    return "restricted";
+                if (jwt.Claims.ContainsKey("_claim_names")) { return "overage"; }
+                if (jwt.Claims.ContainsKey("groups") &amp;&amp; jwt.Claims["groups"].Length > 0) {
+                    return string.Join(",", jwt.Claims["groups"]);
                 }
-                return "full";
+                return "none";
             }</value>
         </set-header>
         <!-- Proves to the backend that the request came through this gateway. Resolved from Key Vault. -->
         <set-header name="x-apim-secret" exists-action="override">
             <value>{{apim-backend-secret}}</value>
         </set-header>
-        <!-- Backend no longer validates tokens; don't forward them. -->
+        <!--
+          Forward the already-validated caller token so ask_data can call the Fabric Data Agent on the user's
+          behalf (On-Behalf-Of). The backend uses it only together with x-apim-secret. Overrides any
+          client-supplied value.
+        -->
+        <set-header name="x-user-token" exists-action="override">
+            <value>@(context.Request.Headers.GetValueOrDefault("Authorization","").Replace("Bearer ",""))</value>
+        </set-header>
+        <!-- The backend doesn't validate Authorization itself; it reads the token from x-user-token above. -->
         <set-header name="Authorization" exists-action="delete" />
     </inbound>
     <backend>
-        <base />
+        <!-- ask_data calls to the Fabric Data Agent take 8-30 s; allow 60 s before APIM gives up. -->
+        <forward-request timeout="60" />
     </backend>
     <outbound>
         <base />

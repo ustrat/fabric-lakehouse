@@ -10,9 +10,11 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "express": "^4.19.2",
     "@azure/cosmos": "^4.1.1",
     "@azure/identity": "^4.4.1",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "express": "^4.19.2",
+    "mssql": "^12.7.14",
     "openai": "^4.60.0"
   }
 }

@@ -3,20 +3,48 @@ const express = require("express");
 const { CosmosClient } = require("@azure/cosmos");
 const { DefaultAzureCredential, getBearerTokenProvider } = require("@azure/identity");
 const { AzureOpenAI } = require("openai");
+const { createDal } = require("./dal");
+const { createRetailRouter } = require("./retail/router");
 
 const PORT = process.env.PORT || 8080;
 const COSMOS_ENDPOINT = process.env.COSMOS_ENDPOINT || "https://bc836f6d-54c1-43a9-b890-87cdb4428a90.zbc.sql.cosmos.fabric.microsoft.com:443/";
 const DATABASE_NAME = "operational_db";
-const FULL_CONTAINER = "supply_chain_dashboard";
-const RESTRICTED_CONTAINER = "supply_chain_dashboard_restricted";
+const DATA_CONTAINER = "supply_chain_dashboard";
+const CONFIG_CONTAINER = "access_config";
+const RESTRICTED_GROUPS_DOC = "restricted_groups";
+const RESTRICTED_GROUPS_TTL_MS = 5 * 60 * 1000;
 const OPENAI_ENDPOINT = process.env.OPENAI_ENDPOINT || "https://ustrat-ai-foundry.openai.azure.com/";
 const OPENAI_DEPLOYMENT = process.env.OPENAI_DEPLOYMENT || "gpt-5-mini";
 
 // Resolved by App Service from a Key Vault reference; APIM injects the same value on every request.
 const BACKEND_SHARED_SECRET = process.env.BACKEND_SHARED_SECRET;
 
-// Auth, CORS and the restricted/full decision all happen in APIM. This service only accepts
-// traffic proving it came through APIM, and trusts APIM's x-data-scope header for container choice.
+const credential = new DefaultAzureCredential();
+const database = new CosmosClient({ endpoint: COSMOS_ENDPOINT, aadCredentials: credential }).database(DATABASE_NAME);
+const dataContainer = database.container(DATA_CONTAINER);
+const configContainer = database.container(CONFIG_CONTAINER);
+
+// Row-level security is defined once, as OneLake data access roles on the Lakehouse. The sync
+// notebook reads those roles, tags each row with the restricted groups allowed to see it
+// (visible_to_groups), and writes the set of restricted groups here. Nothing is hardcoded in this service.
+let restrictedGroupsCache = { groups: null, fetchedAt: 0 };
+
+async function getRestrictedGroups() {
+  if (restrictedGroupsCache.groups && Date.now() - restrictedGroupsCache.fetchedAt < RESTRICTED_GROUPS_TTL_MS) {
+    return restrictedGroupsCache.groups;
+  }
+  try {
+    const { resource } = await configContainer.item(RESTRICTED_GROUPS_DOC, RESTRICTED_GROUPS_DOC).read();
+    if (!resource || !Array.isArray(resource.groups)) throw new Error("restricted_groups document missing or malformed");
+    restrictedGroupsCache = { groups: new Set(resource.groups), fetchedAt: Date.now() };
+  } catch (err) {
+    // A stale list is still a restriction; only fail when there is nothing to enforce with.
+    if (!restrictedGroupsCache.groups) throw err;
+    console.error("Using stale restricted-group list:", err.message);
+  }
+  return restrictedGroupsCache.groups;
+}
+
 function requireGateway(req, res, next) {
   if (!BACKEND_SHARED_SECRET) {
     console.error("BACKEND_SHARED_SECRET is not configured - refusing all requests");
@@ -30,17 +58,48 @@ function requireGateway(req, res, next) {
   next();
 }
 
-const credential = new DefaultAzureCredential();
-const database = new CosmosClient({ endpoint: COSMOS_ENDPOINT, aadCredentials: credential }).database(DATABASE_NAME);
-const containers = {
-  full: database.container(FULL_CONTAINER),
-  restricted: database.container(RESTRICTED_CONTAINER),
-};
+// APIM always sends x-caller-groups: "none", "overage", or a comma-separated list of group IDs.
+// Resolves to req.access = { full: true } or { full: false, groups: [...] }.
+async function resolveAccess(req, res, next) {
+  const header = req.headers["x-caller-groups"];
+  if (!header) {
+    // Missing means the gateway policy isn't doing its job; refuse rather than default to full access.
+    return res.status(403).json({ error: "Caller group information missing" });
+  }
+  if (header === "overage") {
+    return res.status(403).json({ error: "Group membership too large to evaluate; contact an administrator" });
+  }
 
-// Anything other than an explicit "full" gets the restricted container, so a missing or
-// mangled header fails closed rather than exposing everything.
-function containerFor(req) {
-  return req.headers["x-data-scope"] === "full" ? containers.full : containers.restricted;
+  let restricted;
+  try {
+    restricted = await getRestrictedGroups();
+  } catch (err) {
+    console.error("Cannot load restricted groups:", err.message);
+    return res.status(503).json({ error: "Access rules unavailable" });
+  }
+
+  const callerGroups = header === "none" ? [] : header.split(",").map((g) => g.trim()).filter(Boolean);
+  const callerRestrictedGroups = callerGroups.filter((g) => restricted.has(g));
+  req.access = callerRestrictedGroups.length ? { full: false, groups: callerRestrictedGroups } : { full: true };
+  next();
+}
+
+const VISIBLE_TO_CALLER = "EXISTS(SELECT VALUE g FROM g IN c.visible_to_groups WHERE ARRAY_CONTAINS(@groups, g))";
+
+async function queryIndicators(access, seriesId) {
+  const conditions = [];
+  const parameters = [];
+  if (!access.full) {
+    conditions.push(VISIBLE_TO_CALLER);
+    parameters.push({ name: "@groups", value: access.groups });
+  }
+  if (seriesId) {
+    conditions.push("c.id = @id");
+    parameters.push({ name: "@id", value: seriesId });
+  }
+  const where = conditions.length ? ` WHERE ${conditions.join(" AND ")}` : "";
+  const { resources } = await dataContainer.items.query({ query: `SELECT * FROM c${where}`, parameters }).fetchAll();
+  return resources;
 }
 
 const azureADTokenProvider = getBearerTokenProvider(credential, "https://cognitiveservices.azure.com/.default");
@@ -54,46 +113,44 @@ const openaiClient = new AzureOpenAI({
 const app = express();
 app.use(express.json());
 
+// Retail operations routed by registry/operations.json (REST for the app + /api/retail/tools for AI).
+app.use(createRetailRouter({ dal: createDal({ credential }), middleware: [requireGateway, resolveAccess] }));
+
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-app.get("/api/indicators", requireGateway, async (req, res) => {
+app.get("/api/indicators", requireGateway, resolveAccess, async (req, res) => {
   try {
-    const { resources } = await containerFor(req).items.readAll().fetchAll();
-    res.json(resources);
+    res.json(await queryIndicators(req.access));
   } catch (err) {
     console.error("Failed to read indicators:", err.message);
     res.status(502).json({ error: "Failed to read indicators", detail: err.message });
   }
 });
 
-app.get("/api/indicators/:seriesId", requireGateway, async (req, res) => {
+app.get("/api/indicators/:seriesId", requireGateway, resolveAccess, async (req, res) => {
   const { seriesId } = req.params;
   try {
-    const { resource } = await containerFor(req).item(seriesId, seriesId).read();
+    const [resource] = await queryIndicators(req.access, seriesId);
     if (!resource) {
       return res.status(404).json({ error: `No indicator found for series_id '${seriesId}'` });
     }
     res.json(resource);
   } catch (err) {
-    if (err.code === 404) {
-      return res.status(404).json({ error: `No indicator found for series_id '${seriesId}'` });
-    }
     console.error("Failed to read indicator:", err.message);
     res.status(502).json({ error: "Failed to read indicator", detail: err.message });
   }
 });
 
-app.post("/api/chat", requireGateway, async (req, res) => {
+app.post("/api/chat", requireGateway, resolveAccess, async (req, res) => {
   const { message } = req.body || {};
   if (!message || typeof message !== "string") {
     return res.status(400).json({ error: "Request body must include a 'message' string" });
   }
 
   try {
-    const { resources } = await containerFor(req).items.readAll().fetchAll();
-    const context = resources
+    const context = (await queryIndicators(req.access))
       .map((r) => `- ${r.metric_name} (${r.series_id}): ${r.value} as of ${r.observation_date}, source ${r.source}`)
       .join("\n");
 
