@@ -39,7 +39,7 @@
             <value>@{
                 var jwt = (Jwt)context.Variables["jwt"];
                 if (jwt.Claims.ContainsKey("_claim_names")) { return "overage"; }
-                if (jwt.Claims.ContainsKey("groups") && jwt.Claims["groups"].Length > 0) {
+                if (jwt.Claims.ContainsKey("groups") &amp;&amp; jwt.Claims["groups"].Length > 0) {
                     return string.Join(",", jwt.Claims["groups"]);
                 }
                 return "none";
